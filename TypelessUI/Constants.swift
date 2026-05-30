@@ -1,10 +1,15 @@
 import Foundation
 
 /// 集中管理 UserDefaults keys 和应用常量
+///
+/// - Important: `Constants.Keys` 中的 UserDefaults key 已标记为 deprecated。
+///   请使用 `AppConfig.shared` 统一访问配置项。
+///   示例: `AppConfig.shared.llmEnabled` 替代 `UserDefaults.standard.bool(forKey: Constants.Keys.llmEnabled)`
 enum Constants {
 
-    // MARK: - UserDefaults Keys
+    // MARK: - UserDefaults Keys (Deprecated)
 
+    @available(*, deprecated, message: "Use AppConfig.shared instead. Example: AppConfig.shared.llmEnabled")
     enum Keys {
         static let whisperModel = "whisperModel"
         static let language = "language"
