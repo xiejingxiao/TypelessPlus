@@ -189,7 +189,7 @@ final class WhisperBridge {
     // MARK: - 查找路径（优先从 UserDefaults 读取，兼容自动检测）
 
     private func findPythonPath() -> String {
-        if let customPath = UserDefaults.standard.string(forKey: Constants.Keys.pythonPath),
+        if let customPath = AppConfig.shared.pythonPath as String?,
            !customPath.isEmpty,
            FileManager.default.fileExists(atPath: customPath) {
             if validatePython(path: customPath) { return customPath }
@@ -263,7 +263,7 @@ final class WhisperBridge {
 
     /// 通过 Bundle 或可执行文件路径推算项目目录
     private func findProjectDir() -> String {
-        if let customDir = UserDefaults.standard.string(forKey: Constants.Keys.projectDir),
+        if let customDir = AppConfig.shared.projectDir as String?,
            !customDir.isEmpty,
            FileManager.default.fileExists(atPath: customDir) {
             return customDir
@@ -370,8 +370,9 @@ final class WhisperBridge {
                         completion(.failure(WhisperError.serverError("Request timed out after \(Int(timeout))s")))
                         return
                     }
-                    Thread.sleep(forTimeInterval: 0.05)
-                    readResponse()
+                    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.05) {
+                        readResponse()
+                    }
                     return
                 }
 

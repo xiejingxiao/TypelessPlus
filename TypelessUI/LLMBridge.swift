@@ -46,7 +46,7 @@ final class LLMBridge {
 
     // MARK: - F2: 当前活跃任务（用于取消）
 
-    private var currentTask: Task<Void, Never>?
+    private var currentCancelHandler: (() -> Void)?
 
     // MARK: - F2: 网络可达性监控器
 
@@ -207,7 +207,7 @@ final class LLMBridge {
             }
         }
 
-        currentTask = task
+        currentCancelHandler = { task.cancel() }
 
         let result = await task.value
 
@@ -223,7 +223,11 @@ final class LLMBridge {
 
     private func executeLLMRequest(text: String, style: RewriteStyle, retryCount: Int = 0) async -> Result<String, Error> {
         await withCheckedContinuation { continuation in
-            let url = URL(string: "\(config.apiBase)/chat/completions")!
+            guard let url = URL(string: "\(config.apiBase)/chat/completions") else {
+                print("[LLMBridge] ❌ Invalid API base URL: \(config.apiBase)")
+                continuation.resume(returning: .failure(LLMBridgeError.connectionFailed("Invalid API base URL: \(config.apiBase)")))
+                return
+            }
 
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
@@ -368,8 +372,8 @@ final class LLMBridge {
     // MARK: - F2: 取消当前请求
 
     func cancelCurrentRequest() {
-        currentTask?.cancel()
-        currentTask = nil
+        currentCancelHandler?()
+        currentCancelHandler = nil
         operationQueue.cancelAllOperations()
     }
 
@@ -378,8 +382,8 @@ final class LLMBridge {
     private func startNetworkMonitoring() {
         networkMonitor.pathUpdateHandler = { [weak self] path in
             DispatchQueue.main.async {
-                self?.isNetworkAvailable = path.status == .satisfied
-                if !path.status.isSatisfied {
+                self?.isNetworkAvailable = (path.status == .satisfied)
+                if path.status != .satisfied {
                     print("[LLMBridge] 📡 Network status changed: \(path.status)")
                 }
             }

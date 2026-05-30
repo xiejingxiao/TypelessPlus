@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import AVFoundation
 import ApplicationServices
+@preconcurrency import Combine
 
 // MARK: - Error Presentation
 
@@ -50,7 +51,7 @@ enum ErrorPresenter {
     private static func openLogInFinder() {
         let logPath = AppConfig.shared.logFilePath
         let logURL = URL(fileURLWithPath: logPath)
-        NSWorkspace.shared.selectFile(logPath.path, inFileViewerRootedAtPath: logURL.deletingLastPathComponent().path)
+        NSWorkspace.shared.selectFile(logURL.path(), inFileViewerRootedAtPath: logURL.deletingLastPathComponent().path())
     }
 }
 
@@ -132,7 +133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var appState: AppState = .idle {
         didSet { updateUI() }
     }
-    private var volumeObservation: NSKeyValueObservation?
+    private var volumeObservation: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -185,12 +186,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
 
         let llmItem = NSMenuItem(title: "AI 润色增强", action: #selector(toggleLLM), keyEquivalent: "l")
-        llmItem.state = UserDefaults.standard.bool(forKey: Constants.Keys.llmEnabled) ? .on : .off
+        llmItem.state = AppConfig.shared.llmEnabled ? .on : .off
         menu.addItem(llmItem)
 
         let styleMenu = NSMenu()
         styleMenu.title = "润色风格"
-        let currentStyle = UserDefaults.standard.string(forKey: Constants.Keys.rewriteStyle) ?? Constants.Defaults.rewriteStyle
+        let currentStyle = AppConfig.shared.llmStyle
         for style in LLMBridge.RewriteStyle.allCases {
             let item = NSMenuItem(title: style.displayName, action: #selector(selectStyle(_:)), keyEquivalent: "")
             item.representedObject = style.rawValue
@@ -210,9 +211,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupOverlayWindow() {
         overlayWindow = OverlayWindow()
-        volumeObservation = audioRecorder.observe(\.volumeLevel, options: .new) { [weak self] _, change in
-            if let level = change.newValue {
-                self?.overlayWindow?.updateVolumeLevel(level)
+        volumeObservation = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.overlayWindow?.updateVolumeLevel(self?.audioRecorder.volumeLevel ?? 0.0)
             }
         }
     }
@@ -313,7 +314,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func transcribeWithBridge(audioData: Data, sampleRate: Int) async throws -> String {
-        return try await withCheckedContinuation { continuation in
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, any Error>) in
             whisperBridge.transcribe(audioData: audioData, sampleRate: sampleRate) { result in
                 switch result {
                 case .success(let text):
@@ -336,7 +337,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let llmEnabled = UserDefaults.standard.bool(forKey: Constants.Keys.llmEnabled)
+        let llmEnabled = AppConfig.shared.llmEnabled
         if llmEnabled {
             await processWithLLMRetry(text: text)
         } else {
@@ -354,7 +355,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func processWithLLMRetry(text: String) async {
         appState = .llmProcessing
 
-        let styleStr = UserDefaults.standard.string(forKey: Constants.Keys.rewriteStyle) ?? Constants.Defaults.rewriteStyle
+        let styleStr = AppConfig.shared.llmStyle
         let style = LLMBridge.RewriteStyle(rawValue: styleStr) ?? .clean
 
         do {
@@ -369,7 +370,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func rewriteWithLLM(text: String, style: LLMBridge.RewriteStyle) async throws -> String {
-        return try await withCheckedContinuation { continuation in
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, any Error>) in
             LLMBridge.shared.rewrite(text: text, style: style) { result in
                 switch result {
                 case .success(let rewritten):
@@ -427,8 +428,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 菜单动作
 
     @objc private func toggleLLM() {
-        let newValue = !UserDefaults.standard.bool(forKey: Constants.Keys.llmEnabled)
-        UserDefaults.standard.set(newValue, forKey: Constants.Keys.llmEnabled)
+        let newValue = !AppConfig.shared.llmEnabled
+        AppConfig.shared.llmEnabled = newValue
         LLMBridge.shared.config.enabled = newValue
 
         if let menu = statusItem.menu,
@@ -439,7 +440,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func selectStyle(_ sender: NSMenuItem) {
         guard let styleRaw = sender.representedObject as? String else { return }
-        UserDefaults.standard.set(styleRaw, forKey: Constants.Keys.rewriteStyle)
+        AppConfig.shared.llmStyle = styleRaw
 
         if let menu = statusItem.menu,
            let styleParent = menu.items.first(where: { $0.submenu?.title == "润色风格" }),
@@ -457,6 +458,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func quitApp() {
         hotkeyMonitor.stopListening()
         whisperBridge.shutdown()
+        volumeObservation?.invalidate()
+        volumeObservation = nil
         NSApplication.shared.terminate(nil)
     }
 }
