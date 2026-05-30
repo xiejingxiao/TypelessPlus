@@ -1,6 +1,13 @@
 import AVFoundation
 import Foundation
 
+enum StopReason {
+    case userReleased
+    case timeout
+    case sizeLimitExceeded
+    case error(Error)
+}
+
 /// 音频录制器：使用 AVAudioEngine 采集麦克风输入，降采样到 16kHz
 final class AudioRecorder: NSObject {
     private let engine = AVAudioEngine()
@@ -8,8 +15,23 @@ final class AudioRecorder: NSObject {
     private var sampleRate: Double = 16000
     private let bufferQueue = DispatchQueue(label: "com.typeless.audio")
 
+    // MARK: - Timeout & Size Protection
+    var maxDuration: TimeInterval = 120
+    private var startTime: Date?
+    private var timeoutTimer: Timer?
+    private var sizeCheckTimer: Timer?
+    let maxFileSize: Int = 50 * 1024 * 1024
+
+    var currentFileSize: Int {
+        bufferQueue.sync { audioBuffer.count }
+    }
+
     func startRecording() {
         audioBuffer = Data()
+        startTime = Date()
+        startTimeoutTimer()
+        startSizeCheckTimer()
+
         let inputNode = engine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
 
@@ -53,6 +75,7 @@ final class AudioRecorder: NSObject {
             self.bufferQueue.async {
                 self.audioBuffer.append(data)
             }
+            self.calculateVolume(from: buffer)
         }
     }
 
@@ -127,28 +150,105 @@ final class AudioRecorder: NSObject {
             self.bufferQueue.async {
                 self.audioBuffer.append(data)
             }
+            self.calculateVolume(from: convertedBuffer)
         }
     }
 
     // MARK: - 停止录音
 
-    func stopRecording(completion: @escaping (Data, Int) -> Void) {
+    func stopRecording(completion: @escaping (Data, Int, StopReason) -> Void) {
+        stopProtectionTimers()
+
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
+        DispatchQueue.main.async {
+            self.volumeLevel = 0.0
+            self.smoothedVolume = 0.0
+        }
 
         bufferQueue.async { [weak self] in
             guard let self = self else { return }
             let data = self.audioBuffer
             let sr = 16000
-            print("[AudioRecorder] Stopped, captured \(data.count) bytes (\(Double(data.count) / 2.0 / 16000.0)s)")
+            let reason: StopReason
+            if let start = self.startTime, Date().timeIntervalSince(start) >= self.maxDuration {
+                reason = .timeout
+            } else if data.count >= self.maxFileSize {
+                reason = .sizeLimitExceeded
+            } else {
+                reason = .userReleased
+            }
+            print("[AudioRecorder] Stopped, reason: \(reason), captured \(data.count) bytes (\(Double(data.count) / 2.0 / 16000.0)s)")
             DispatchQueue.global().async {
-                completion(data, sr)
+                completion(data, sr, reason)
             }
         }
     }
 
+    // MARK: - Protection Timers
+
+    private func startTimeoutTimer() {
+        timeoutTimer?.invalidate()
+        timeoutTimer = Timer.scheduledTimer(
+            withTimeInterval: maxDuration,
+            repeats: false
+        ) { [weak self] _ in
+            guard let self = self, self.engine.isRunning else { return }
+            print("[AudioRecorder] Max duration (\(self.maxDuration)s) reached, auto-stopping")
+            self.stopRecording { _, _, reason in
+                print("[AudioRecorder] Auto-stopped due to: \(reason)")
+            }
+        }
+    }
+
+    private func startSizeCheckTimer() {
+        sizeCheckTimer?.invalidate()
+        sizeCheckTimer = Timer.scheduledTimer(
+            withTimeInterval: 5,
+            repeats: true
+        ) { [weak self] _ in
+            guard let self = self, self.engine.isRunning else { return }
+            let size = self.currentFileSize
+            if size >= self.maxFileSize {
+                print("[AudioRecorder] File size limit (\(self.maxFileSize / 1024 / 1024)MB) exceeded (\(size / 1024 / 1024)MB), auto-stopping")
+                self.stopRecording { _, _, reason in
+                    print("[AudioRecorder] Auto-stopped due to: \(reason)")
+                }
+            }
+        }
+    }
+
+    private func stopProtectionTimers() {
+        timeoutTimer?.invalidate()
+        timeoutTimer = nil
+        sizeCheckTimer?.invalidate()
+        sizeCheckTimer = nil
+    }
+
     var isRecording: Bool {
         engine.isRunning
+    }
+
+    @Published var volumeLevel: Double = 0.0
+    private var smoothedVolume: Double = 0.0
+    private let smoothingFactor: Double = 0.3
+
+    private func calculateVolume(from buffer: AVAudioPCMBuffer) {
+        guard let floatData = buffer.floatChannelData?[0] else { return }
+        let frameLength = Int(buffer.frameLength)
+        guard frameLength > 0 else { return }
+
+        var sum: Float = 0
+        for i in 0..<frameLength {
+            sum += floatData[i] * floatData[i]
+        }
+        let rms = sqrt(sum / Float(frameLength))
+        let normalizedVolume = min(Double(rms) * 5.0, 1.0)
+
+        smoothedVolume = smoothingFactor * normalizedVolume + (1 - smoothingFactor) * smoothedVolume
+        DispatchQueue.main.async {
+            self.volumeLevel = self.smoothedVolume
+        }
     }
 
     // MARK: - Helpers

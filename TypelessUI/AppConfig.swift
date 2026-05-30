@@ -138,8 +138,9 @@ final class AppConfig {
         static let projectDir: String = ""
 
         static var logFilePath: String {
-            FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
-                .appendingPathComponent("typeless_debug.log").path ?? "/tmp/typeless_debug.log"
+            let logsDir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first?
+                .appendingPathComponent("Logs/TypelessPlus")?.path ?? "/tmp"
+            return "\(logsDir)/typeless_debug.log"
         }
     }
 

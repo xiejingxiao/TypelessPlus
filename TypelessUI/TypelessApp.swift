@@ -3,6 +3,57 @@ import AppKit
 import AVFoundation
 import ApplicationServices
 
+// MARK: - Error Presentation
+
+enum ErrorPresenter {
+    static func show(for error: Error, window: NSWindow? = nil) {
+        let friendlyMessage = resolveFriendlyMessage(error)
+        let alert = NSAlert()
+        alert.messageText = "操作遇到问题"
+        alert.informativeText = friendlyMessage
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "确定")
+        alert.addButton(withTitle: "查看日志")
+
+        let response = alert.runModal()
+        if response == .alertSecondButtonReturn {
+            openLogInFinder()
+        }
+    }
+
+    static func resolveFriendlyMessage(_ error: Error) -> String {
+        if let whisperErr = error as? WhisperError {
+            return whisperErr.friendlyMessage
+        }
+        if let llmErr = error as? LLMBridgeError {
+            return llmErr.friendlyMessage
+        }
+
+        let nsError = error as NSError
+        switch nsError.domain {
+        case NSPOSIXErrorDomain:
+            return "系统资源暂时不可用，请稍后重试"
+        case NSURLErrorDomain:
+            let urlErrors: [Int: String] = [
+                NSURLErrorTimedOut: "网络请求超时，请检查网络连接",
+                NSURLErrorNetworkConnectionLost: "网络连接中断，请重新连接网络",
+                NSURLErrorNotConnectedToInternet: "设备未连接到互联网",
+                NSURLErrorCannotConnectToHost: "无法连接到目标服务器",
+            ]
+            if let msg = urlErrors[nsError.code] { return msg }
+            return "网络错误 (\(nsError.code))"
+        default:
+            return error.localizedDescription
+        }
+    }
+
+    private static func openLogInFinder() {
+        let logPath = AppConfig.shared.logFilePath
+        let logURL = URL(fileURLWithPath: logPath)
+        NSWorkspace.shared.selectFile(logPath.path, inFileViewerRootedAtPath: logURL.deletingLastPathComponent().path)
+    }
+}
+
 // MARK: - Error Classification
 enum ErrorCategory {
     case recoverable
@@ -81,6 +132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var appState: AppState = .idle {
         didSet { updateUI() }
     }
+    private var volumeObservation: NSKeyValueObservation?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -158,6 +210,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupOverlayWindow() {
         overlayWindow = OverlayWindow()
+        volumeObservation = audioRecorder.observe(\.volumeLevel, options: .new) { [weak self] _, change in
+            if let level = change.newValue {
+                self?.overlayWindow?.updateVolumeLevel(level)
+            }
+        }
     }
 
     private func requestPermissions() {
@@ -244,7 +301,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     await self.handleTranscriptionResult(text)
                 } catch {
                     DispatchQueue.main.async {
-                        self.appState = .error(error.localizedDescription)
+                        let friendlyMsg = ErrorPresenter.resolveFriendlyMessage(error)
+                        self.appState = .error(friendlyMsg)
                         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
                             self.appState = .idle
                         }

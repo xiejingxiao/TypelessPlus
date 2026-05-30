@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// 设置面板（v2 — 精简版：只保留实际生效的功能）
 struct SettingsView: View {
@@ -92,6 +93,20 @@ struct SettingsView: View {
                 Text("切换模型需要重启应用")
                     .font(.caption)
                     .foregroundColor(.secondary)
+            }
+
+            Section("调试") {
+                Button {
+                    openLogDirectory()
+                } label: {
+                    Label("查看日志", systemImage: "doc.text.magnifyingglass")
+                }
+                .help("在 Finder 中打开日志目录")
+                Text(AppConfig.shared.logFilePath)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
         }
         .formStyle(.grouped)
@@ -225,5 +240,17 @@ struct SettingsView: View {
                 }
             }
         }
+    }
+
+    private func openLogDirectory() {
+        let logPath = AppConfig.shared.logFilePath
+        let logURL = URL(fileURLWithPath: logPath)
+        let directoryURL = logURL.deletingLastPathComponent()
+
+        if !FileManager.default.fileExists(atPath: directoryURL.path) {
+            try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        }
+
+        NSWorkspace.shared.selectFile(logPath, inFileViewerRootedAtPath: directoryURL.path)
     }
 }
