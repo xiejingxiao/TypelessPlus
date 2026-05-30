@@ -1,0 +1,36 @@
+# Build outputs
+.build/
+DerivedData/
+
+# Xcode
+*.xcworkspace
+xcuserdata/
+*.xcuserstate
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Models (large files, download via install_models.sh)
+models/
+*.bin
+*.ggml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# Test artifacts
+Tests/E2ETestApp
+Tests/KeyVisualApp
+Tests/KeyVisualApp.app
+
+# Temp
+temp/
+*.wav

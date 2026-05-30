@@ -1,0 +1,31 @@
+#!/bin/bash
+set -e
+cd "$(dirname "$0")"
+
+# 1. 编译 Swift 代码（不依赖宏）
+echo "🔧 编译 Swift 可执行文件..."
+swiftc -target arm64-apple-macos14.0 \
+  -I LocalPackages/KeyboardShortcuts/Sources/KeyboardShortcuts \
+  -I LocalPackages/Defaults/Sources/Defaults \
+  -framework AppKit \
+  -framework AVFoundation \
+  -framework CoreGraphics \
+  -framework Foundation \
+  TypelessUI/*.swift \
+  -o TypelessUI/Typeless++
+
+# 2. 复制资源
+cp Info.plist TypelessUI/
+cp server.py TypelessUI/
+
+# 3. 创建启动脚本
+cat > run.sh << 'EOS'
+#!/bin/bash
+cd "$(dirname "$0")"
+export PATH="/Users/carylab/Library/Application Support/com.tencent.mac.marvis/components/MarvisAgent/Versions/1.0.0.10049/runtime/python311/bin:$PATH"
+export HF_ENDPOINT="https://hf-mirror.com"
+./TypelessUI/Typeless++
+EOS
+chmod +x run.sh
+
+echo "✅ 构建完成"
