@@ -79,14 +79,22 @@ final class AppConfig {
         didSet { save(.logFilePath, value: logFilePath) }
     }
 
-    // MARK: - Whisper Configuration
+    // MARK: - ASR Configuration
 
-    var whisperModel: String {
-        didSet { save(.whisperModel, value: whisperModel) }
+    var asrEngine: String {
+        didSet { save(.asrEngine, value: asrEngine) }
+    }
+
+    var asrModel: String {
+        didSet { save(.asrModel, value: asrModel) }
     }
 
     var language: String {
         didSet { save(.language, value: language) }
+    }
+
+    var hotwords: String {
+        didSet { save(.hotwords, value: hotwords) }
     }
 
     // MARK: - Paths
@@ -113,8 +121,10 @@ final class AppConfig {
         case autoRetryOnError
         case enableVolumeIndicator
         case logFilePath
-        case whisperModel
+        case asrEngine
+        case asrModel
         case language
+        case hotwords
         case pythonPath
         case projectDir
     }
@@ -132,43 +142,50 @@ final class AppConfig {
         static let watchdogInterval: TimeInterval = 5.0
         static let autoRetryOnError: Bool = true
         static let enableVolumeIndicator: Bool = true
-        static let whisperModel: String = "base"
+        static let asrEngine: String = "vibevoice"
+        static let asrModel: String = "vibevoice-asr-q4_k.gguf"
         static let language: String = "auto"
+        static let hotwords: String = ""
         static let pythonPath: String = "/usr/bin/python3"
         static let projectDir: String = ""
 
         static var logFilePath: String {
-            let logsDir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first?
-                .appendingPathComponent("Logs/TypelessPlus")?.path ?? "/tmp"
-            return "\(logsDir)/typeless_debug.log"
+            if let logsDir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first?
+                .appendingPathComponent("Logs/TypelessPlus") {
+                return logsDir.path + "/typeless_debug.log"
+            }
+            return "/tmp/typeless_debug.log"
         }
     }
 
     // MARK: - Initialization
 
     private init() {
-        self.llmEnabled = load(.llmEnabled, default: Defaults.llmEnabled)
-        self.llmStyle = load(.llmStyle, default: Defaults.llmStyle)
-        self.llmApiBase = load(.llmApiBase, default: Defaults.llmApiBase)
-        self.llmModel = load(.llmModel, default: Defaults.llmModel)
-        self.clipboardSafeMode = load(.clipboardSafeMode, default: Defaults.clipboardSafeMode)
-        self.inputSpeedDelay = load(.inputSpeedDelay, default: Defaults.inputSpeedDelay)
-        self.maxRecordingDuration = load(.maxRecordingDuration, default: Defaults.maxRecordingDuration)
-        self.watchdogInterval = load(.watchdogInterval, default: Defaults.watchdogInterval)
-        self.autoRetryOnError = load(.autoRetryOnError, default: Defaults.autoRetryOnError)
-        self.enableVolumeIndicator = load(.enableVolumeIndicator, default: Defaults.enableVolumeIndicator)
-        self.logFilePath = load(.logFilePath, default: Defaults.logFilePath)
-        self.whisperModel = load(.whisperModel, default: Defaults.whisperModel)
-        self.language = load(.language, default: Defaults.language)
-        self.pythonPath = load(.pythonPath, default: Defaults.pythonPath)
-        self.projectDir = load(.projectDir, default: Defaults.projectDir)
+        let defaults = UserDefaults.standard
+        self.llmEnabled = Self.load(.llmEnabled, default: Defaults.llmEnabled, from: defaults)
+        self.llmStyle = Self.load(.llmStyle, default: Defaults.llmStyle, from: defaults)
+        self.llmApiBase = Self.load(.llmApiBase, default: Defaults.llmApiBase, from: defaults)
+        self.llmModel = Self.load(.llmModel, default: Defaults.llmModel, from: defaults)
+        self.clipboardSafeMode = Self.load(.clipboardSafeMode, default: Defaults.clipboardSafeMode, from: defaults)
+        self.inputSpeedDelay = Self.load(.inputSpeedDelay, default: Defaults.inputSpeedDelay, from: defaults)
+        self.maxRecordingDuration = Self.load(.maxRecordingDuration, default: Defaults.maxRecordingDuration, from: defaults)
+        self.watchdogInterval = Self.load(.watchdogInterval, default: Defaults.watchdogInterval, from: defaults)
+        self.autoRetryOnError = Self.load(.autoRetryOnError, default: Defaults.autoRetryOnError, from: defaults)
+        self.enableVolumeIndicator = Self.load(.enableVolumeIndicator, default: Defaults.enableVolumeIndicator, from: defaults)
+        self.logFilePath = Self.load(.logFilePath, default: Defaults.logFilePath, from: defaults)
+        self.asrEngine = Self.load(.asrEngine, default: Defaults.asrEngine, from: defaults)
+        self.asrModel = Self.load(.asrModel, default: Defaults.asrModel, from: defaults)
+        self.language = Self.load(.language, default: Defaults.language, from: defaults)
+        self.hotwords = Self.load(.hotwords, default: Defaults.hotwords, from: defaults)
+        self.pythonPath = Self.load(.pythonPath, default: Defaults.pythonPath, from: defaults)
+        self.projectDir = Self.load(.projectDir, default: Defaults.projectDir, from: defaults)
 
         validateAll()
     }
 
     // MARK: - Persistence
 
-    private func load<T>(_ key: Key, default defaultValue: T) -> T {
+    private static func load<T>(_ key: Key, default defaultValue: T, from defaults: UserDefaults) -> T {
         guard let value = defaults.object(forKey: rawKey(key)) as? T else {
             return defaultValue
         }
@@ -176,11 +193,11 @@ final class AppConfig {
     }
 
     private func save<T>(_ key: Key, value: T) {
-        defaults.set(value, forKey: rawKey(key))
+        defaults.set(value, forKey: Self.rawKey(key))
     }
 
-    private func rawKey(_ key: Key) -> String {
-        "\(suiteName).\(key.rawValue)"
+    private static func rawKey(_ key: Key) -> String {
+        "com.typeless.appconfig.\(key.rawValue)"
     }
 
     func resetToDefaults() {
@@ -195,8 +212,10 @@ final class AppConfig {
         autoRetryOnError = Defaults.autoRetryOnError
         enableVolumeIndicator = Defaults.enableVolumeIndicator
         logFilePath = Defaults.logFilePath
-        whisperModel = Defaults.whisperModel
+        asrEngine = Defaults.asrEngine
+        asrModel = Defaults.asrModel
         language = Defaults.language
+        hotwords = Defaults.hotwords
         pythonPath = Defaults.pythonPath
         projectDir = Defaults.projectDir
     }
@@ -236,10 +255,16 @@ final class AppConfig {
             llmStyle = Defaults.llmStyle
         }
 
-        let validModels = ["tiny", "base", "small", "medium"]
-        if !validModels.contains(whisperModel) {
-            warnings.append("whisperModel (\(whisperModel)) is not a valid model, resetting to default")
-            whisperModel = Defaults.whisperModel
+        let validEngines = ["vibevoice", "whisper"]
+        if !validEngines.contains(asrEngine) {
+            warnings.append("asrEngine (\(asrEngine)) is not a valid engine, resetting to default")
+            asrEngine = Defaults.asrEngine
+        }
+
+        let validModels = ["vibevoice-asr-q4_k.gguf", "vibevoice-asr-f16.gguf",
+                           "tiny", "base", "small", "medium"]
+        if !validModels.contains(asrModel) {
+            warnings.append("asrModel (\(asrModel)) is not a known model")
         }
 
         if !warnings.isEmpty {
@@ -266,7 +291,7 @@ final class AppConfig {
           Keyboard: clipboardSafe=\(clipboardSafeMode), speedDelay=\(inputSpeedDelay)ms
           Stability: maxRecord=\(maxRecordingDuration)s, watchdog=\(watchdogInterval)s, retry=\(autoRetryOnError)
           UX: volumeIndicator=\(enableVolumeIndicator), log=\(logFilePath)
-          Whisper: model=\(whisperModel), lang=\(language)
+          ASR: engine=\(asrEngine), model=\(asrModel), lang=\(language), hotwords=\(hotwords)
           Paths: python=\(pythonPath), project=\(projectDir)
         """
     }

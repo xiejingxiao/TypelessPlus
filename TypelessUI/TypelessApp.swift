@@ -127,7 +127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var audioRecorder = AudioRecorder()
     private var keyboardEmulator = KeyboardEmulator()
-    private var whisperBridge = WhisperBridge()
+    private var vibeVoiceBridge = VibeVoiceBridge()
     private var hotkeyMonitor = GlobalHotkeyMonitor()
     private var overlayWindow: OverlayWindow?
     private var appState: AppState = .idle {
@@ -165,8 +165,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         requestPermissions()
 
-        whisperBridge.initialize { success in
-            appLog("WhisperBridge initialized: \(success)")
+        vibeVoiceBridge.initialize(model: AppConfig.shared.asrModel) { success in
+            appLog("VibeVoiceBridge initialized: \(success)")
         }
     }
 
@@ -315,7 +315,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func transcribeWithBridge(audioData: Data, sampleRate: Int) async throws -> String {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, any Error>) in
-            whisperBridge.transcribe(audioData: audioData, sampleRate: sampleRate) { result in
+            let hotwords = AppConfig.shared.hotwords
+            vibeVoiceBridge.transcribe(audioData: audioData, sampleRate: sampleRate,
+                                       language: AppConfig.shared.language,
+                                       hotwords: hotwords) { result in
                 switch result {
                 case .success(let text):
                     continuation.resume(returning: text)
@@ -457,7 +460,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quitApp() {
         hotkeyMonitor.stopListening()
-        whisperBridge.shutdown()
+        vibeVoiceBridge.shutdown()
         volumeObservation?.invalidate()
         volumeObservation = nil
         NSApplication.shared.terminate(nil)
