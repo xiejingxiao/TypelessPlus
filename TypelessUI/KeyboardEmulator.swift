@@ -7,31 +7,58 @@ import os.log
 final class KeyboardEmulator {
 
     // MARK: - Configuration
-    
+
     /// 剪贴板安全模式开关（默认开启）
     private let clipboardSafeMode: Bool = true
-    
+
     /// 剪贴板恢复延迟（纳秒）
     private let clipboardRestoreDelay: UInt64 = 200_000_000 // 200ms
-    
+
+    /// 逐字输入延迟（微秒），从 AppConfig 读取
+    private var characterDelay: UInt32 {
+        UInt32(AppConfig.shared.inputSpeedDelay) * 1000
+    }
+
     // MARK: - State Protection
-    
+
     /// 防重入锁：防止并发粘贴操作导致状态混乱
     private var isPasting: Bool = false
-    
+
     /// 日志记录器
     private static let logger = Logger(subsystem: "com.typelessplus.keyboard", category: "KeyboardEmulator")
+
+    // MARK: - Special Character Key Mapping
+
+    /// 特殊字符 → (keyCode, modifiers) 映射表
+    /// 覆盖 US ANSI 键盘布局下所有 Shift+BaseKey 生成的符号
+    static let specialKeyMap: [Character: (keyCode: CGKeyCode, modifiers: CGEventFlags)] = [
+        "@": (0x13, .maskShift),
+        "#": (0x14, .maskShift),
+        "$": (0x15, .maskShift),
+        "%": (0x17, .maskShift),
+        "^": (0x16, .maskShift),
+        "&": (0x1A, .maskShift),
+        "*": (0x1C, .maskShift),
+        "(": (0x19, .maskShift),
+        ")": (0x1D, .maskShift),
+        "_": (0x1B, .maskShift),
+        "+": (0x18, .maskShift),
+        "{": (0x21, .maskShift),
+        "}": (0x1E, .maskShift),
+        "|": (0x2A, .maskShift),
+        ":": (0x29, .maskShift),
+        "\"": (0x27, .maskShift),
+        "<": (0x2B, .maskShift),
+        ">": (0x2F, .maskShift),
+        "?": (0x2C, .maskShift),
+        "~": (0x32, .maskShift),
+    ]
 
     /// 将文本输出到当前焦点应用
     func type(text: String) {
         guard !text.isEmpty else { return }
 
-        // 中文等多字节文本，统一用剪贴板粘贴（更快更可靠）
-        // 纯 ASCII 短文本可以用逐字符输入
-        let isPureASCII = text.allSatisfy { $0.isASCII }
-        let isShort = text.count <= 50
-
-        if isPureASCII && isShort {
+        if shouldUseCharacterMode(text) {
             typeCharacterByCharacter(text)
         } else {
             Task {
@@ -40,21 +67,37 @@ final class KeyboardEmulator {
         }
     }
 
-    // MARK: - 逐字符输入（仅 ASCII 短文本）
+    // MARK: - 智能模式选择
+
+    /// 判断是否使用逐字符输入模式
+    /// 条件：纯 ASCII 且长度 < 20 → 逐字模式（更快，不污染剪贴板）
+    /// 否则 → 剪贴板模式（支持中文/长文本）
+    private func shouldUseCharacterMode(_ text: String) -> Bool {
+        let isPureASCII = text.allSatisfy { $0.isASCII }
+        let isShort = text.count < 20
+        return isPureASCII && isShort
+    }
+
+    // MARK: - 逐字符输入（ASCII 文本，含完整特殊字符支持）
 
     private func typeCharacterByCharacter(_ text: String) {
         for char in text {
-            if let keyCode = asciiKeyCodeMap(String(char).lowercased()) {
+            if let mapping = Self.specialKeyMap[char] {
+                postKeyEvent(keyCode: mapping.keyCode, flags: mapping.modifiers)
+            } else if let keyCode = asciiKeyCodeMap(String(char).lowercased()) {
                 postKeyEvent(keyCode: keyCode, shift: char.isUppercase)
             } else if char == " " {
-                postKeyEvent(keyCode: 0x31, shift: false)
+                postKeyEvent(keyCode: 0x31, flags: [])
+            } else if char == "\n" || char == "\r" {
+                postKeyEvent(keyCode: 0x24, flags: [])
+            } else if char == "\t" {
+                postKeyEvent(keyCode: 0x30, flags: [])
             } else {
-                // 无法映射的字符，走剪贴板
                 Task {
                     await pasteText(String(char))
                 }
             }
-            usleep(3000) // 3ms 间隔
+            usleep(characterDelay)
         }
     }
 
@@ -195,24 +238,37 @@ final class KeyboardEmulator {
 
     // MARK: - CGEvent 工具
 
-    private func postKeyEvent(keyCode: CGKeyCode, shift: Bool) {
+    private func postKeyEvent(keyCode: CGKeyCode, flags: CGEventFlags = []) {
         let source = CGEventSource(stateID: .privateState)
 
-        if shift {
-            let shiftDown = CGEvent(keyboardEventSource: source, virtualKey: 0x38, keyDown: true)
-            shiftDown?.post(tap: .cghidEventTap)
+        var activeModifiers: [CGKeyCode] = []
+        if flags.contains(.maskShift) { activeModifiers.append(0x38) }
+        if flags.contains(.maskCommand) { activeModifiers.append(0x37) }
+        if flags.contains(.maskAlternate) { activeModifiers.append(0x3A) }
+        if flags.contains(.maskControl) { activeModifiers.append(0x3B) }
+
+        for modKeyCode in activeModifiers {
+            let modDown = CGEvent(keyboardEventSource: source, virtualKey: modKeyCode, keyDown: true)
+            modDown?.post(tap: .cghidEventTap)
         }
 
         let keyDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true)
+        keyDown?.flags = flags
         keyDown?.post(tap: .cghidEventTap)
 
         let keyUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false)
+        keyUp?.flags = flags
         keyUp?.post(tap: .cghidEventTap)
 
-        if shift {
-            let shiftUp = CGEvent(keyboardEventSource: source, virtualKey: 0x38, keyDown: false)
-            shiftUp?.post(tap: .cghidEventTap)
+        for modKeyCode in activeModifiers.reversed() {
+            let modUp = CGEvent(keyboardEventSource: source, virtualKey: modKeyCode, keyDown: false)
+            modUp?.post(tap: .cghidEventTap)
         }
+    }
+
+    @available(*, deprecated, renamed: "postKeyEvent(keyCode:flags:)")
+    private func postKeyEvent(keyCode: CGKeyCode, shift: Bool) {
+        postKeyEvent(keyCode: keyCode, flags: shift ? .maskShift : [])
     }
 
     // ASCII 到 CGKeyCode 映射
