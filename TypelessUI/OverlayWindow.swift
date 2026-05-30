@@ -7,6 +7,7 @@ enum AppState {
     case recording
     case transcribing
     case llmProcessing
+    case keyboardOutputting
     case ready(String)
     case error(String)
 
@@ -16,6 +17,7 @@ enum AppState {
         case .recording: return "正在聆听..."
         case .transcribing: return "识别中..."
         case .llmProcessing: return "AI 润色中..."
+        case .keyboardOutputting: return "输入中..."
         case .ready(let text): return text
         case .error(let msg): return "错误: \(msg)"
         }
@@ -27,6 +29,7 @@ enum AppState {
         case .recording: return "mic.badge.plus"
         case .transcribing: return "waveform.circle.fill"
         case .llmProcessing: return "sparkles"
+        case .keyboardOutputting: return "keyboard"
         case .ready: return "checkmark.circle.fill"
         case .error: return "exclamationmark.circle.fill"
         }
@@ -38,6 +41,7 @@ enum AppState {
         case .recording: return .red
         case .transcribing: return .blue
         case .llmProcessing: return .purple
+        case .keyboardOutputting: return .orange
         case .ready: return .green
         case .error: return .red
         }

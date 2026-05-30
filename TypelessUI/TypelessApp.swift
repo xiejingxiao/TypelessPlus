@@ -3,6 +3,61 @@ import AppKit
 import AVFoundation
 import ApplicationServices
 
+// MARK: - Error Classification
+enum ErrorCategory {
+    case recoverable
+    case userActionRequired
+    case fatal
+
+    static func classify(_ error: Error) -> ErrorCategory {
+        let nsError = error as NSError
+        switch nsError.domain {
+        case NSPOSIXErrorDomain:
+            return .recoverable
+        case NSURLErrorDomain:
+            let urlErrors: Set<Int> = [
+                NSURLErrorTimedOut, NSURLErrorNetworkConnectionLost,
+                NSURLErrorNotConnectedToInternet, NSURLErrorCannotConnectToHost
+            ]
+            if urlErrors.contains(nsError.code) { return .recoverable }
+            return .userActionRequired
+        default:
+            if let whisperErr = error as? WhisperError {
+                switch whisperErr {
+                case .processNotRunning, .serverError: return .recoverable
+                default: return .fatal
+                }
+            }
+            return .fatal
+        }
+    }
+}
+
+// MARK: - Retry Decorator
+func withRetry<T>(
+    maxRetries: Int = 1,
+    operation: () async throws -> T
+) async throws -> T {
+    var lastError: Error?
+    for attempt in 0...maxRetries {
+        do {
+            return try await operation()
+        } catch {
+            lastError = error
+            guard attempt < maxRetries else { break }
+            let category = ErrorCategory.classify(error)
+            guard category == .recoverable else {
+                print("[Retry] Non-recoverable error (\(category)), not retrying: \(error.localizedDescription)")
+                throw error
+            }
+            let delay = UInt64(pow(2.0, Double(attempt))) * 1_000_000_000
+            print("[Retry] Attempt \(attempt + 1)/\(maxRetries + 1) failed: \(error.localizedDescription), retrying in \(delay / 1_000_000_000)s...")
+            try? await Task.sleep(nanoseconds: delay)
+        }
+    }
+    throw lastError!
+}
+
 // MARK: - 应用入口
 @main
 struct TypelessApp: App {
@@ -156,8 +211,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func stopRecording() {
         appState = .transcribing
 
-        audioRecorder.stopRecording { [weak self] audioData, sampleRate in
+        audioRecorder.stopRecording { [weak self] audioData, sampleRate, stopReason in
             guard let self = self else { return }
+
+            switch stopReason {
+            case .timeout:
+                print("[App] Recording stopped due to timeout")
+            case .sizeLimitExceeded:
+                print("[App] Recording stopped due to size limit")
+            case .error(let err):
+                print("[App] Recording stopped due to error: \(err)")
+            case .userReleased:
+                break
+            }
 
             let duration = Double(audioData.count) / 2.0 / Double(sampleRate)
             guard duration > Constants.Timing.minRecordingDuration else {
@@ -170,26 +236,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
 
-            self.whisperBridge.transcribe(audioData: audioData, sampleRate: sampleRate) { result in
-                DispatchQueue.main.async {
-                    switch result {
-                    case .success(let text):
-                        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                            self.appState = .error("未识别到语音内容")
-                            DispatchQueue.main.asyncAfter(deadline: .now() + Constants.Timing.errorDisplayDuration) {
-                                self.appState = .idle
-                            }
-                            return
-                        }
-
-                        let llmEnabled = UserDefaults.standard.bool(forKey: Constants.Keys.llmEnabled)
-                        if llmEnabled {
-                            self.processWithLLM(text: text)
-                        } else {
-                            self.finalizeOutput(text: text)
-                        }
-
-                    case .failure(let error):
+            Task {
+                do {
+                    let text = try await withRetry(maxRetries: 1) {
+                        try await self.transcribeWithBridge(audioData: audioData, sampleRate: sampleRate)
+                    }
+                    await self.handleTranscriptionResult(text)
+                } catch {
+                    DispatchQueue.main.async {
                         self.appState = .error(error.localizedDescription)
                         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
                             self.appState = .idle
@@ -200,24 +254,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func transcribeWithBridge(audioData: Data, sampleRate: Int) async throws -> String {
+        return try await withCheckedContinuation { continuation in
+            whisperBridge.transcribe(audioData: audioData, sampleRate: sampleRate) { result in
+                switch result {
+                case .success(let text):
+                    continuation.resume(returning: text)
+                case .failure(let error):
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func handleTranscriptionResult(_ text: String) async {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            DispatchQueue.main.async {
+                self.appState = .error("未识别到语音内容")
+                DispatchQueue.main.asyncAfter(deadline: .now() + Constants.Timing.errorDisplayDuration) {
+                    self.appState = .idle
+                }
+            }
+            return
+        }
+
+        let llmEnabled = UserDefaults.standard.bool(forKey: Constants.Keys.llmEnabled)
+        if llmEnabled {
+            await processWithLLMRetry(text: text)
+        } else {
+            finalizeOutput(text: text)
+        }
+    }
+
     // MARK: - LLM 后处理
 
     private func processWithLLM(text: String) {
+        appState = .llmProcessing
+        Task { await processWithLLMRetry(text: text) }
+    }
+
+    private func processWithLLMRetry(text: String) async {
         appState = .llmProcessing
 
         let styleStr = UserDefaults.standard.string(forKey: Constants.Keys.rewriteStyle) ?? Constants.Defaults.rewriteStyle
         let style = LLMBridge.RewriteStyle(rawValue: styleStr) ?? .clean
 
-        LLMBridge.shared.rewrite(text: text, style: style) { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
+        do {
+            let rewritten = try await withRetry(maxRetries: 1) {
+                try await self.rewriteWithLLM(text: text, style: style)
+            }
+            finalizeOutput(text: rewritten)
+        } catch {
+            print("[AppDelegate] LLM retry failed, using original text: \(error.localizedDescription)")
+            finalizeOutput(text: text)
+        }
+    }
+
+    private func rewriteWithLLM(text: String, style: LLMBridge.RewriteStyle) async throws -> String {
+        return try await withCheckedContinuation { continuation in
+            LLMBridge.shared.rewrite(text: text, style: style) { result in
                 switch result {
                 case .success(let rewritten):
-                    self.finalizeOutput(text: rewritten)
-                case .failure:
-                    // LLM 失败，直接使用原始文本（Python 端已做过 TextProcessor）
-                    print("[AppDelegate] LLM failed, using original text")
-                    self.finalizeOutput(text: text)
+                    continuation.resume(returning: rewritten)
+                case .failure(let error):
+                    continuation.resume(throwing: error)
                 }
             }
         }
@@ -226,14 +326,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 最终输出
 
     private func finalizeOutput(text: String) {
+        print("[AppDelegate] Finalizing output with text: \(text.prefix(50))...")
         appState = .ready(text)
         overlayWindow?.show(with: appState)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + Constants.Timing.overlayShowDuration) {
+            self.appState = .keyboardOutputting
+            self.overlayWindow?.update(self.appState)
+
+            print("[AppDelegate] Starting keyboard emulation")
             self.keyboardEmulator.type(text: text)
+
             DispatchQueue.main.asyncAfter(deadline: .now() + Constants.Timing.overlayFadeDuration) {
                 self.overlayWindow?.hide()
                 self.appState = .idle
+                print("[AppDelegate] Output cycle completed")
             }
         }
     }
@@ -250,7 +357,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch appState {
         case .idle:
             overlayWindow?.hide()
-        case .recording, .transcribing, .llmProcessing:
+        case .recording, .transcribing, .llmProcessing, .keyboardOutputting:
             overlayWindow?.show(with: appState)
         case .ready:
             overlayWindow?.update(appState)
