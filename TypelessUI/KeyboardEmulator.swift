@@ -1,9 +1,26 @@
 import AppKit
 import Carbon
 import CoreGraphics
+import os.log
 
 /// 模拟键盘输入：将识别文本通过 CGEventPost 键入到当前焦点应用
 final class KeyboardEmulator {
+
+    // MARK: - Configuration
+    
+    /// 剪贴板安全模式开关（默认开启）
+    private let clipboardSafeMode: Bool = true
+    
+    /// 剪贴板恢复延迟（纳秒）
+    private let clipboardRestoreDelay: UInt64 = 200_000_000 // 200ms
+    
+    // MARK: - State Protection
+    
+    /// 防重入锁：防止并发粘贴操作导致状态混乱
+    private var isPasting: Bool = false
+    
+    /// 日志记录器
+    private static let logger = Logger(subsystem: "com.typelessplus.keyboard", category: "KeyboardEmulator")
 
     /// 将文本输出到当前焦点应用
     func type(text: String) {
@@ -17,7 +34,9 @@ final class KeyboardEmulator {
         if isPureASCII && isShort {
             typeCharacterByCharacter(text)
         } else {
-            pasteSafely(text: text)
+            Task {
+                await pasteText(text)
+            }
         }
     }
 
@@ -31,28 +50,133 @@ final class KeyboardEmulator {
                 postKeyEvent(keyCode: 0x31, shift: false)
             } else {
                 // 无法映射的字符，走剪贴板
-                pasteSafely(text: String(char))
+                Task {
+                    await pasteText(String(char))
+                }
             }
             usleep(3000) // 3ms 间隔
         }
     }
 
-    // MARK: - 安全剪贴板粘贴
+    // MARK: - 安全剪贴板粘贴（增强版）
 
     /// 安全的剪贴板粘贴：保存原始内容 → 写入 → 粘贴 → 恢复
-    private func pasteSafely(text: String) {
-        let pasteboard = NSPasteboard.general
+    /// 实现三步法 + 防重入保护 + 线程安全 + 错误处理
+    func pasteText(_ text: String) async {
+        guard !text.isEmpty else { return }
+        
+        // 防重入检查
+        guard !isPasting else {
+            Self.logger.warning("⚠️ Clipboard operation already in progress, skipping concurrent call")
+            return
+        }
+        
+        isPasting = true
+        defer { isPasting = false }
 
-        // 保存原始剪贴板内容
-        let oldContent = pasteboard.string(forType: .string)
-        let oldData = pasteboard.data(forType: .rtf)
-        let oldFileURL = pasteboard.string(forType: .fileURL)
+        // 如果安全模式关闭，直接粘贴不保存
+        guard clipboardSafeMode else {
+            await directPaste(text: text)
+            return
+        }
 
-        // 写入新内容
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+        // Step 1: 在主线程保存原剪贴板
+        let originalClipboard = await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                let pasteboard = NSPasteboard.general
+                let originalContent = pasteboard.string(forType: .string)
+                continuation.resume(returning: originalContent)
+            }
+        }
 
-        // 模拟 Cmd+V
+        // Step 2: 写入新内容并粘贴
+        do {
+            try await writeAndPaste(text: text)
+            
+            // Step 3: 200ms 后恢复原剪贴板
+            try? await Task.sleep(nanoseconds: clipboardRestoreDelay)
+            
+            await restoreClipboard(originalContent: originalClipboard)
+            
+        } catch {
+            Self.logger.error("❌ Paste failed: \(error.localizedDescription), falling back to character-by-character input")
+            // Fallback: 使用逐字输入模式
+            fallbackToCharacterInput(text)
+        }
+    }
+    
+    // MARK: - Private Helpers
+    
+    /// 直接粘贴（不保存剪贴板，用于安全模式关闭时）
+    private func directPaste(text: String) async {
+        DispatchQueue.main.async {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
+            self.postCommandV()
+        }
+    }
+    
+    /// 写入内容并执行 Cmd+V
+    private func writeAndPaste(text: String) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            DispatchQueue.main.async {
+                let pasteboard = NSPasteboard.general
+                
+                do {
+                    // 清空并写入新内容
+                    pasteboard.clearContents()
+                    let success = pasteboard.setString(text, forType: .string)
+                    
+                    guard success else {
+                        continuation.resume(throwing: NSError(
+                            domain: "KeyboardEmulator",
+                            code: -1,
+                            userInfo: [NSLocalizedDescriptionKey: "Failed to write to clipboard"]
+                        ))
+                        return
+                    }
+                    
+                    // 执行 Cmd+V
+                    self.postCommandV()
+                    
+                    continuation.resume(())
+                    
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+    
+    /// 恢复原剪贴板内容
+    private func restoreClipboard(originalContent: String?) async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                guard let original = originalContent else {
+                    continuation.resume(())
+                    return
+                }
+                
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString(original, forType: .string)
+                
+                Self.logger.info("✅ Clipboard restored successfully")
+                continuation.resume(())
+            }
+        }
+    }
+    
+    /// Fallback: 逐字输入模式
+    private func fallbackToCharacterInput(_ text: String) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.typeCharacterByCharacter(text)
+        }
+    }
+    
+    /// 发送 Cmd+V 快捷键
+    private func postCommandV() {
         let source = CGEventSource(stateID: .privateState)
 
         let cmdDown = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: true)
@@ -67,20 +191,6 @@ final class KeyboardEmulator {
         vDown?.post(tap: .cghidEventTap)
         vUp?.post(tap: .cghidEventTap)
         cmdUp?.post(tap: .cghidEventTap)
-
-        // 延迟恢复剪贴板（给粘贴操作足够的处理时间）
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            pasteboard.clearContents()
-            if let old = oldContent {
-                pasteboard.setString(old, forType: .string)
-            }
-            if let data = oldData {
-                pasteboard.setData(data, forType: .rtf)
-            }
-            if let url = oldFileURL {
-                pasteboard.setString(url, forType: .fileURL)
-            }
-        }
     }
 
     // MARK: - CGEvent 工具
