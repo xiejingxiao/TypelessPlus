@@ -1,7 +1,15 @@
 import Foundation
+import Network
 
 /// 本地 LLM API 客户端（OpenAI 兼容格式）
 /// 支持 Ollama、LM Studio、vLLM 等本地推理引擎
+///
+/// ## F2 增强功能：
+/// - ✅ 请求串行队列（防止并发竞态）
+/// - ✅ 30秒超时机制（Task Group + race）
+/// - ✅ 全面错误处理与降级策略矩阵
+/// - ✅ 网络可达性检测（NWPathMonitor）
+/// - ✅ 请求取消支持（Task.cancel()）
 final class LLMBridge {
     static let shared = LLMBridge()
 
@@ -26,14 +34,48 @@ final class LLMBridge {
 
     var config = Config.fromDefaults()
 
+    // MARK: - F2: 请求串行队列
+
+    private let operationQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        queue.qualityOfService = .userInitiated
+        queue.name = "com.typelessplus.llm.request.queue"
+        return queue
+    }()
+
+    // MARK: - F2: 当前活跃任务（用于取消）
+
+    private var currentTask: Task<Void, Never>?
+
+    // MARK: - F2: 网络可达性监控器
+
+    private let networkMonitor = NWPathMonitor()
+    private let networkQueue = DispatchQueue(label: "com.typelessplus.llm.network.monitor")
+    @Published private(set) var isNetworkAvailable: Bool = true
+
+    // MARK: - F2: Session 级禁用标志
+
+    private var isSessionDisabled: Bool = false
+
+    // MARK: - 初始化
+
+    init() {
+        startNetworkMonitoring()
+    }
+
+    deinit {
+        networkMonitor.cancel()
+    }
+
     // MARK: - 润色风格
 
     enum RewriteStyle: String, CaseIterable {
-        case clean = "clean"       // 清理润色（去填充词、修语法、加标点）
-        case formal = "formal"     // 正式书面
-        case casual = "casual"     // 轻松口语
-        case expand = "expand"     // 扩写润色
-        case compact = "compact"   // 精简压缩
+        case clean = "clean"
+        case formal = "formal"
+        case casual = "casual"
+        case expand = "expand"
+        case compact = "compact"
 
         var displayName: String {
             switch self {
@@ -109,7 +151,7 @@ final class LLMBridge {
         }
     }
 
-    // MARK: - 润色接口
+    // MARK: - F2: 增强版润色接口
 
     func rewrite(text: String, style: RewriteStyle = .clean, completion: @escaping (Result<String, Error>) -> Void) {
         guard config.enabled else {
@@ -122,57 +164,235 @@ final class LLMBridge {
             return
         }
 
-        let url = URL(string: "\(config.apiBase)/chat/completions")!
+        guard !isSessionDisabled else {
+            print("[LLMBridge] Session disabled due to auth error")
+            completion(.failure(LLMBridgeError.sessionDisabled))
+            return
+        }
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = config.timeout
+        guard isNetworkAvailable else {
+            print("[LLMBridge] Network offline, skipping LLM call")
+            completion(.failure(LLMBridgeError.networkOffline))
+            return
+        }
 
-        let body: [String: Any] = [
-            "model": config.model,
-            "messages": [
-                ["role": "system", "content": style.systemPrompt],
-                ["role": "user", "content": text],
-            ],
-            "max_tokens": config.maxTokens,
-            "temperature": config.temperature,
-        ]
+        cancelCurrentRequest()
 
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        let operation = AsyncBlockOperation { [weak self] in
+            await self?.performRewrite(text: text, style: style, completion: completion)
+        }
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            if let error = error {
-                // 网络错误，可能是 LLM 服务未启动
-                print("[LLMBridge] Request error: \(error.localizedDescription)")
-                completion(.failure(LLMBridgeError.connectionFailed(error.localizedDescription)))
-                return
+        operationQueue.addOperation(operation)
+    }
+
+    // MARK: - F2: 执行润色请求（含超时和重试）
+
+    private func performRewrite(text: String, style: RewriteStyle, completion: @escaping (Result<String, Error>) -> Void) async {
+        let task = Task {
+            await withTaskGroup(of: Result<String, Error>.self) { group in
+                group.addTask {
+                    await self.executeLLMRequest(text: text, style: style)
+                }
+
+                group.addTask {
+                    try? await Task.sleep(nanoseconds: 30_000_000_000)
+                    return .failure(LLMBridgeError.timeout)
+                }
+
+                if let result = await group.next() {
+                    group.cancelAll()
+                    return result
+                }
+                return .failure(LLMBridgeError.timeout)
             }
+        }
 
-            guard let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                completion(.failure(LLMBridgeError.invalidResponse))
-                return
-            }
+        currentTask = task
 
-            // 检查 API 错误
-            if let apiError = json["error"] as? [String: Any],
-               let message = apiError["message"] as? String {
-                completion(.failure(LLMBridgeError.apiError(message)))
-                return
-            }
+        let result = await task.value
 
-            // 提取响应文本
-            if let choices = json["choices"] as? [[String: Any]],
-               let firstChoice = choices.first,
-               let message = firstChoice["message"] as? [String: Any],
-               let content = message["content"] as? String {
-                let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-                completion(.success(trimmed))
-            } else {
-                completion(.failure(LLMBridgeError.invalidResponse))
+        switch result {
+        case .success(let rewrittenText):
+            completion(.success(rewrittenText))
+        case .failure(let error):
+            handleLLMError(error, originalText: text, completion: completion)
+        }
+    }
+
+    // MARK: - F2: 执行实际 LLM 请求
+
+    private func executeLLMRequest(text: String, style: RewriteStyle, retryCount: Int = 0) async -> Result<String, Error> {
+        await withCheckedContinuation { continuation in
+            let url = URL(string: "\(config.apiBase)/chat/completions")!
+
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.timeoutInterval = config.timeout
+
+            let body: [String: Any] = [
+                "model": config.model,
+                "messages": [
+                    ["role": "system", "content": style.systemPrompt],
+                    ["role": "user", "content": text],
+                ],
+                "max_tokens": config.maxTokens,
+                "temperature": config.temperature,
+            ]
+
+            request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+            URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+                if Task.isCancelled {
+                    continuation.resume(returning: .failure(LLMBridgeError.cancelled))
+                    return
+                }
+
+                if let error = error {
+                    let nsError = error as NSError
+                    let statusCode = (response as? HTTPURLResponse)?.statusCode
+
+                    if let code = statusCode {
+                        switch code {
+                        case 401, 403:
+                            self?.isSessionDisabled = true
+                            continuation.resume(returning: .failure(LLMBridgeError.authFailed("API Key 无效或权限不足")))
+                        case 429:
+                            if retryCount < 1 {
+                                Task {
+                                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                                    let retryResult = await self?.executeLLMRequest(text: text, style: style, retryCount: retryCount + 1) ?? .failure(error)
+                                    continuation.resume(returning: retryResult)
+                                }
+                                return
+                            } else {
+                                continuation.resume(returning: .failure(LLMBridgeError.rateLimited("请求过于频繁，请稍后再试")))
+                            }
+                        case 500...599:
+                            if retryCount < 1 {
+                                Task {
+                                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                                    let retryResult = await self?.executeLLMRequest(text: text, style: style, retryCount: retryCount + 1) ?? .failure(error)
+                                    continuation.resume(returning: retryResult)
+                                }
+                                return
+                            } else {
+                                continuation.resume(returning: .failure(LLMBridgeError.serverError("服务器错误 (\(code))")))
+                            }
+                        default:
+                            continuation.resume(returning: .failure(LLMBridgeError.connectionFailed(error.localizedDescription)))
+                        }
+                    } else if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorNotConnectedToInternet {
+                        continuation.resume(returning: .failure(LLMBridgeError.networkOffline))
+                    } else {
+                        continuation.resume(returning: .failure(LLMBridgeError.connectionFailed(error.localizedDescription)))
+                    }
+                    return
+                }
+
+                guard let data = data,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    continuation.resume(returning: .failure(LLMBridgeError.invalidResponse))
+                    return
+                }
+
+                if let apiError = json["error"] as? [String: Any],
+                   let message = apiError["message"] as? String {
+                    continuation.resume(returning: .failure(LLMBridgeError.apiError(message)))
+                    return
+                }
+
+                if let choices = json["choices"] as? [[String: Any]],
+                   let firstChoice = choices.first,
+                   let message = firstChoice["message"] as? [String: Any],
+                   let content = message["content"] as? String {
+                    let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                    continuation.resume(returning: .success(trimmed))
+                } else {
+                    continuation.resume(returning: .failure(LLMBridgeError.invalidResponse))
+                }
+            }.resume()
+        }
+    }
+
+    // MARK: - F2: 错误处理与降级策略
+
+    private func handleLLMError(_ error: Error, originalText: String, completion: @escaping (Result<String, Error>) -> Void) {
+        switch error {
+        case LLMBridgeError.timeout:
+            print("[LLMBridge] ⏰ Request timeout, using original text")
+            NotificationCenter.default.post(name: .llmToastNotification, object: nil, userInfo: [
+                "message": "AI 暂时繁忙",
+                "type": "warning"
+            ])
+            completion(.success(originalText))
+
+        case LLMBridgeError.authFailed(let message):
+            print("[LLMBridge] 🔒 Auth failed: \(message)")
+            NotificationCenter.default.post(name: .llmAlertNotification, object: nil, userInfo: [
+                "title": "API 配置错误",
+                "message": "请检查 API Key 或服务地址配置"
+            ])
+            completion(.failure(error))
+
+        case LLMBridgeError.rateLimited(let message):
+            print("[LLMBridge] ⚠️ Rate limited: \(message)")
+            NotificationCenter.default.post(name: .llmToastNotification, object: nil, userInfo: [
+                "message": "稍等片刻...",
+                "type": "info"
+            ])
+            completion(.success(originalText))
+
+        case LLMBridgeError.serverError(let message):
+            print("[LLMBridge] 💥 Server error: \(message)")
+            NotificationCenter.default.post(name: .llmToastNotification, object: nil, userInfo: [
+                "message": "AI 服务异常",
+                "type": "error"
+            ])
+            completion(.success(originalText))
+
+        case LLMBridgeError.networkOffline:
+            print("[LLMBridge] 📡 Network offline, silent degradation")
+            completion(.success(originalText))
+
+        case LLMBridgeError.cancelled:
+            print("[LLMBridge] ❌ Request cancelled by user")
+            completion(.failure(error))
+
+        default:
+            print("[LLMBridge] ❓ Unknown error: \(error.localizedDescription)")
+            completion(.failure(error))
+        }
+    }
+
+    // MARK: - F2: 取消当前请求
+
+    func cancelCurrentRequest() {
+        currentTask?.cancel()
+        currentTask = nil
+        operationQueue.cancelAllOperations()
+    }
+
+    // MARK: - F2: 网络监控
+
+    private func startNetworkMonitoring() {
+        networkMonitor.pathUpdateHandler = { [weak self] path in
+            DispatchQueue.main.async {
+                self?.isNetworkAvailable = path.status == .satisfied
+                if !path.status.isSatisfied {
+                    print("[LLMBridge] 📡 Network status changed: \(path.status)")
+                }
             }
-        }.resume()
+        }
+        networkMonitor.start(queue: networkQueue)
+    }
+
+    // MARK: - 重置 session 状态
+
+    func resetSession() {
+        isSessionDisabled = false
+        cancelCurrentRequest()
+        print("[LLMBridge] ✅ Session reset")
     }
 
     // MARK: - 健康检查
@@ -225,14 +445,53 @@ final class LLMBridge {
     }
 }
 
-// MARK: - 错误类型
+// MARK: - F2: 异步 Block 操作（用于队列）
+
+private class AsyncBlockOperation: Operation {
+    private let block: () async -> Void
+    private var task: Task<Void, Never>?
+
+    init(_ block: @escaping () async -> Void) {
+        self.block = block
+    }
+
+    override func main() {
+        let semaphore = DispatchSemaphore(value: 0)
+        task = Task {
+            await block()
+            semaphore.signal()
+        }
+        semaphore.wait()
+    }
+
+    override func cancel() {
+        super.cancel()
+        task?.cancel()
+    }
+}
+
+// MARK: - F2: 通知名称扩展
+
+extension Notification.Name {
+    static let llmToastNotification = Notification.Name("com.typelessplus.llm.toast")
+    static let llmAlertNotification = Notification.Name("com.typelessplus.llm.alert")
+}
+
+// MARK: - F2: 增强版错误类型
 
 enum LLMBridgeError: LocalizedError {
     case disabled
     case connectionFailed(String)
     case invalidResponse
     case apiError(String)
+    case apiKeyInvalid
     case timeout
+    case networkOffline
+    case authFailed(String)
+    case rateLimited(String)
+    case serverError(String)
+    case sessionDisabled
+    case cancelled
 
     var errorDescription: String? {
         switch self {
@@ -244,8 +503,87 @@ enum LLMBridgeError: LocalizedError {
             return "LLM 服务响应格式无效"
         case .apiError(let msg):
             return "LLM API 错误: \(msg)"
+        case .apiKeyInvalid:
+            return "API 密钥无效"
         case .timeout:
             return "LLM 请求超时"
+        case .networkOffline:
+            return "网络不可用"
+        case .authFailed(let msg):
+            return "认证失败: \(msg)"
+        case .rateLimited(let msg):
+            return "请求频率限制: \(msg)"
+        case .serverError(let msg):
+            return "服务器错误: \(msg)"
+        case .sessionDisabled:
+            return "LLM 会话已禁用（认证错误）"
+        case .cancelled:
+            return "请求已取消"
+        }
+    }
+
+    var userMessage: String? {
+        switch self {
+        case .timeout:
+            return "AI 暂时繁忙"
+        case .authFailed:
+            return "请检查 API 配置"
+        case .rateLimited:
+            return "稍等片刻..."
+        case .serverError:
+            return "AI 服务异常"
+        case .networkOffline, .disabled, .sessionDisabled:
+            return nil
+        default:
+            return errorDescription
+        }
+    }
+
+    var friendlyMessage: String {
+        switch self {
+        case .disabled:
+            return "LLM 增强功能当前已关闭，可在设置中开启"
+        case .connectionFailed(let msg):
+            if msg.contains("refused") || msg.contains("Connection") {
+                return "无法连接到 LLM 服务，请确认服务已启动（如 Ollama、LM Studio）"
+            }
+            return "LLM 服务连接失败: \(msg)"
+        case .invalidResponse:
+            return "LLM 返回了异常响应，可能模型不支持当前请求格式"
+        case .apiError(let msg):
+            if msg.contains("401") || msg.contains("Unauthorized") || msg.contains("invalid_api_key") {
+                return "API 密钥无效或已过期，请检查 LLM 服务配置"
+            } else if msg.contains("429") || msg.contains("rate_limit") {
+                return "请求过于频繁，请稍后再试"
+            } else if msg.contains("500") || msg.contains("503") {
+                return "LLM 服务内部错误，请检查服务状态"
+            }
+            return "LLM API 报告错误: \(msg)"
+        case .apiKeyInvalid:
+            return "API 密钥无效，请在 AI 助手设置中更新密钥"
+        case .timeout:
+            return "LLM 响应超时，可尝试切换更小的模型或增加超时时间"
+        case .networkOffline:
+            return "网络不可用，请检查网络连接"
+        case .authFailed(let msg):
+            return "认证失败: \(msg)，请检查 API 配置"
+        case .rateLimited:
+            return "请求过于频繁，请稍后再试"
+        case .serverError(let msg):
+            return "AI 服务异常: \(msg)"
+        case .sessionDisabled:
+            return "LLM 会话已禁用，请在设置中重置"
+        case .cancelled:
+            return "请求已取消"
+        }
+    }
+
+    var shouldFallbackToOriginal: Bool {
+        switch self {
+        case .timeout, .rateLimited, .serverError, .networkOffline:
+            return true
+        default:
+            return false
         }
     }
 }

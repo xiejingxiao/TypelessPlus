@@ -9,11 +9,19 @@ final class WhisperBridge {
     private var isReady = false
     private let lock = NSLock()
 
+    // MARK: - Watchdog
+    private var watchdogTimer: Timer?
+    private var restartCount: Int = 0
+    private let maxRestartAttempts: Int = 3
+    private var lastModel: String = "base"
+    private static let backoffDelays: [UInt64] = [2_000_000_000, 4_000_000_000, 8_000_000_000]
+
     // MARK: - 初始化
 
     func initialize(model: String = "base", completion: @escaping (Bool) -> Void) {
         lock.lock()
         defer { lock.unlock() }
+        lastModel = model
 
         if isReady {
             completion(true)
@@ -82,6 +90,7 @@ final class WhisperBridge {
                     self?.isReady = true
                     self?.lock.unlock()
                     self?.log("Model '\(model)' initialized successfully")
+                    self?.startWatchdog()
                     completion(true)
                 } else {
                     let msg = dict["message"] as? String ?? "Unknown error"
@@ -91,6 +100,88 @@ final class WhisperBridge {
             case .failure(let error):
                 self?.log("Init command failed: \(error)")
                 completion(false)
+            }
+        }
+    }
+
+    // MARK: - Watchdog (Process Health Monitor)
+
+    func startWatchdog() {
+        stopWatchdog()
+        watchdogTimer = Timer.scheduledTimer(
+            withTimeInterval: 30,
+            repeats: true
+        ) { [weak self] _ in
+            Task { await self?.checkProcessHealth() }
+        }
+        log("] Watchdog started (interval: 30s)")
+    }
+
+    private func stopWatchdog() {
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
+    }
+
+    private func checkProcessHealth() async {
+        guard let proc = process else { return }
+
+        if !proc.isRunning {
+            log("] Watchdog: Process NOT running, attempting restart (attempt \(restartCount + 1)/\(maxRestartAttempts))")
+            await attemptRestart()
+            return
+        }
+
+        let isAlive = await sendPing()
+        if !isAlive {
+            log("] Watchdog: Process running but not responding, attempting restart (attempt \(restartCount + 1)/\(maxRestartAttempts))")
+            await attemptRestart()
+        }
+    }
+
+    private func sendPing() async -> Bool {
+        return await withCheckedContinuation { continuation in
+            sendCommand(["command": "ping"]) { result in
+                switch result {
+                case .success(let dict):
+                    if dict["status"] as? String == "pong" {
+                        continuation.resume(returning: true)
+                    } else {
+                        continuation.resume(returning: false)
+                    }
+                case .failure:
+                    continuation.resume(returning: false)
+                }
+            }
+        }
+    }
+
+    private func attemptRestart() async {
+        guard restartCount < maxRestartAttempts else {
+            log("] Watchdog: Max restart attempts (\(maxRestartAttempts)) exceeded, giving up")
+            stopWatchdog()
+            lock.lock()
+            isReady = false
+            lock.unlock()
+            return
+        }
+
+        let delay = WhisperBridge.backoffDelays[min(restartCount, WhisperBridge.backoffDelays.count - 1)]
+        log("] Watchdog: Waiting \(delay / 1_000_000_000)s before restart...")
+
+        try? await Task.sleep(nanoseconds: delay)
+
+        cleanup()
+        restartCount += 1
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            initialize(model: lastModel) { success in
+                if success {
+                    self.log("] Watchdog: Restart succeeded (attempt \(self.restartCount))")
+                    self.restartCount = 0
+                } else {
+                    self.log("] Watchdog: Restart failed (attempt \(self.restartCount))")
+                }
+                continuation.resume()
             }
         }
     }
@@ -335,6 +426,8 @@ final class WhisperBridge {
     }
 
     func shutdown() {
+        stopWatchdog()
+        restartCount = 0
         process?.terminate()
         process = nil
         stdinPipe = nil
@@ -342,6 +435,7 @@ final class WhisperBridge {
         lock.lock()
         isReady = false
         lock.unlock()
+        log("] Shutdown complete, watchdog stopped")
     }
 
     private func cleanup() {
@@ -356,6 +450,8 @@ final class WhisperBridge {
 
 enum WhisperError: LocalizedError {
     case notInitialized
+    case serviceNotRunning
+    case permissionDenied
     case processNotRunning
     case invalidCommand
     case invalidResponse
@@ -364,10 +460,30 @@ enum WhisperError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .notInitialized: return "语音识别服务未初始化"
+        case .serviceNotRunning: return "语音识别服务未启动"
+        case .permissionDenied: return "缺少麦克风权限"
         case .processNotRunning: return "服务进程未运行"
         case .invalidCommand: return "命令格式无效"
         case .invalidResponse: return "服务响应无效"
         case .serverError(let msg): return "服务错误: \(msg)"
+        }
+    }
+
+    var friendlyMessage: String {
+        switch self {
+        case .notInitialized: return "语音识别引擎尚未就绪，请稍后再试"
+        case .serviceNotRunning: return "语音识别服务未启动，请检查 Python 环境配置"
+        case .permissionDenied: return "缺少麦克风权限，请在系统设置 → 隐私与安全中授权"
+        case .processNotRunning: return "AI 服务进程异常退出，正在尝试重启..."
+        case .invalidCommand: return "内部通信错误，请重启应用"
+        case .invalidResponse: return "服务返回了无法解析的响应，请检查日志"
+        case .serverError(let msg):
+            if msg.contains("timeout") || msg.contains("timed out") {
+                return "识别请求超时，请缩短录音时长或检查模型大小"
+            } else if msg.contains("No speech") || msg.contains("empty") {
+                return "未检测到有效语音，请靠近麦克风重试"
+            }
+            return "识别服务报告错误: \(msg)"
         }
     }
 }

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 /// 应用状态枚举（统一状态模型，替代字符串判断）
 enum AppState {
@@ -70,6 +71,10 @@ final class OverlayWindow {
         contentState.appState = appState
         contentState.isVisible = true
 
+        if case .recording = appState {
+            contentState.startRecordingTimer()
+        }
+
         if window == nil {
             createWindow()
         }
@@ -79,10 +84,23 @@ final class OverlayWindow {
 
     func update(_ appState: AppState) {
         contentState.appState = appState
+
+        if case .recording = appState {
+            if contentState.recordingDuration == 0 {
+                contentState.startRecordingTimer()
+            }
+        } else {
+            contentState.stopRecordingTimer()
+        }
+    }
+
+    func updateVolumeLevel(_ level: Double) {
+        contentState.volumeLevel = level
     }
 
     func hide() {
         contentState.isVisible = false
+        contentState.stopRecordingTimer()
         DispatchQueue.main.asyncAfter(deadline: .now() + Constants.Timing.overlayFadeDuration) {
             self.window?.orderOut(nil)
         }
@@ -127,6 +145,27 @@ final class OverlayWindow {
 final class OverlayContentState: ObservableObject {
     @Published var appState: AppState = .idle
     @Published var isVisible: Bool = false
+    @Published var volumeLevel: Double = 0.0
+    @Published var recordingDuration: TimeInterval = 0
+    private var recordingTimer: Timer?
+    private var startTime: Date?
+
+    func startRecordingTimer() {
+        startTime = Date()
+        recordingDuration = 0
+        recordingTimer?.invalidate()
+        recordingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let start = self?.startTime else { return }
+            self?.recordingDuration = Date().timeIntervalSince(start)
+        }
+    }
+
+    func stopRecordingTimer() {
+        recordingTimer?.invalidate()
+        recordingTimer = nil
+        startTime = nil
+        recordingDuration = 0
+    }
 }
 
 // MARK: - 悬浮窗内容
@@ -139,34 +178,38 @@ struct OverlayContentView: View {
                 .fill(.ultraThinMaterial)
                 .shadow(color: .black.opacity(0.12), radius: 16, y: 4)
 
-            HStack(spacing: 12) {
-                // 状态图标（基于 enum，不再靠字符串判断）
-                Image(systemName: state.appState.iconName)
-                    .foregroundColor(state.appState.iconColor)
-                    .font(.system(size: 16))
+            VStack(spacing: 10) {
+                HStack(spacing: 12) {
+                    Image(systemName: state.appState.iconName)
+                        .foregroundColor(state.appState.iconColor)
+                        .font(.system(size: 16))
 
-                // 文本内容
-                VStack(alignment: .leading, spacing: 4) {
-                    if state.appState.isProcessing {
-                        Text(state.appState.label)
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundColor(.secondary)
-                    } else {
-                        Text(state.appState.label.isEmpty ? "正在聆听..." : state.appState.label)
-                            .font(.system(size: 15))
-                            .foregroundColor(.primary)
-                            .lineLimit(2)
+                    VStack(alignment: .leading, spacing: 4) {
+                        if state.appState.isProcessing {
+                            Text(state.appState.label)
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundColor(.secondary)
+                        } else {
+                            Text(state.appState.label.isEmpty ? "正在聆听..." : state.appState.label)
+                                .font(.system(size: 15))
+                                .foregroundColor(.primary)
+                                .lineLimit(2)
+                        }
+                    }
+
+                    Spacer()
+
+                    if state.appState.isRecording {
+                        RecordingTimerView(duration: state.recordingDuration)
                     }
                 }
+                .padding(.horizontal, 18)
 
-                Spacer()
-
-                // 波形动画（录音中）
-                if state.appState.isRecording {
-                    waveformAnimation
+                if state.appState.isRecording && AppConfig.shared.enableVolumeIndicator {
+                    VolumeIndicatorView(level: state.volumeLevel)
+                        .padding(.horizontal, 18)
                 }
             }
-            .padding(.horizontal, 18)
             .padding(.vertical, 14)
         }
     }
@@ -187,5 +230,74 @@ struct OverlayContentView: View {
                     )
             }
         }
+    }
+}
+
+// MARK: - 音量指示器
+
+struct VolumeIndicatorView: View {
+    let level: Double
+    @State private var displayLevel: Double = 0.0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            GeometryReader { geometry in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color.primary.opacity(0.1))
+                        .frame(height: 6)
+
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(volumeGradient)
+                        .frame(width: max(geometry.size.width * CGFloat(displayLevel), 3), height: 6)
+                        .animation(.easeOut(duration: 0.1), value: displayLevel)
+                }
+            }
+            .frame(height: 6)
+        }
+        .onChange(of: level) { _, newValue in
+            withAnimation(.easeOut(duration: 0.1)) {
+                displayLevel = newValue
+            }
+        }
+        .onAppear {
+            displayLevel = level
+        }
+    }
+
+    private var volumeGradient: LinearGradient {
+        let colors: [Color]
+        if displayLevel < 0.3 {
+            colors = [Color.green.opacity(0.8), Color.green]
+        } else if displayLevel < 0.7 {
+            colors = [Color.yellow.opacity(0.9), Color.orange]
+        } else {
+            colors = [Color.orange, Color.red]
+        }
+        return LinearGradient(colors: colors, startPoint: .leading, endPoint: .trailing)
+    }
+}
+
+// MARK: - 录音计时器
+
+struct RecordingTimerView: View {
+    let duration: TimeInterval
+
+    private var formattedTime: String {
+        let totalSeconds = Int(duration)
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        return String(format: "%02d:%02d", minutes, seconds)
+    }
+
+    private var isWarning: Bool {
+        duration >= 100
+    }
+
+    var body: some View {
+        Text(formattedTime)
+            .font(.system(size: 15, weight: .monospacedDigit, design: .monospaced))
+            .foregroundColor(isWarning ? .red : .secondary)
+            .animation(.easeInOut(duration: 0.3), value: isWarning)
     }
 }
