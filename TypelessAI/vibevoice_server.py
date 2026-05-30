@@ -119,6 +119,9 @@ class VibeVoiceTranscriber:
         try:
             processed_audio = preprocess_audio(audio_path)
 
+            sys.stderr.write(f"[vibevoice_server] transcribe: lang={language}, hotwords={hotwords!r}\n")
+            sys.stderr.flush()
+
             cmd = [
                 self.crispasr_bin,
                 "--model", self.model_path,
@@ -132,6 +135,8 @@ class VibeVoiceTranscriber:
 
             if hotwords:
                 cmd.extend(["--context", hotwords])
+                sys.stderr.write(f"[vibevoice_server] Using context injection: {hotwords}\n")
+                sys.stderr.flush()
 
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"

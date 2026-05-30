@@ -277,6 +277,9 @@ final class VibeVoiceBridge {
 
         if !hotwords.isEmpty {
             command["hotwords"] = hotwords
+            log("] transcribe with hotwords: \(hotwords)")
+        } else {
+            log("] transcribe without hotwords (empty)")
         }
 
         sendCommand(command) { result in

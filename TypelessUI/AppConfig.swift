@@ -145,7 +145,7 @@ final class AppConfig {
         static let asrEngine: String = "vibevoice"
         static let asrModel: String = "vibevoice-asr-q4_k.gguf"
         static let language: String = "auto"
-        static let hotwords: String = ""
+        static let hotwords: String = "TypelessPlus, SwiftUI, macOS, iOS, Swift, 语音识别, 转写, 录音, 河南, 郑州, 开封, 洛阳, 方言, 口语, 填充词, 中不中, 弄啥嘞, 可得劲, 俺, 恁, 完事儿, 弄完, 得劲, 中, 弄"
         static let pythonPath: String = "/usr/bin/python3"
         static let projectDir: String = ""
 

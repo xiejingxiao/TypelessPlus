@@ -342,9 +342,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let llmEnabled = AppConfig.shared.llmEnabled
         if llmEnabled {
-            await processWithLLMRetry(text: text)
+            let preprocessed = TextPreprocessor.shared.process(text)
+            await processWithLLMRetry(text: preprocessed)
         } else {
-            finalizeOutput(text: text)
+            let cleaned = TextPreprocessor.shared.process(text)
+            finalizeOutput(text: cleaned)
         }
     }
 
